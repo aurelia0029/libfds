@@ -13,6 +13,8 @@
 #include <math.h>
 #include <stdlib.h>
 #include <inttypes.h>
+#include <stdio.h>
+#include <string.h>
 
 #include "branchlut2.h"
 #include "protocols.h"
@@ -27,6 +29,21 @@
 #define IANA_ID_FLAGS 6
 /// IANA identificator of protocols
 #define IANA_ID_PROTO 4
+
+/// Maximum number of custom field mappings
+#define MAX_MAPPINGS 256
+
+/// Structure for ID-based field name mapping
+struct field_mapping {
+    char enterprise_name[64]; // Enterprise name (e.g., "iana", "enterprise12345")
+    uint16_t element_id;      // Element ID
+    char custom_name[32];     // Custom name (e.g., "A", "B", "C")
+};
+
+/// Global mapping table
+static struct field_mapping g_field_mappings[MAX_MAPPINGS];
+static int g_mapping_count = 0;
+static bool g_mappings_loaded = false;
 
 /// Conversion context
 struct context {
@@ -45,6 +62,71 @@ struct context {
     /// Template snapshot
     const fds_tsnapshot_t *snap;
 };
+
+/**
+ * \brief Load custom field mappings from file
+ */
+static void
+load_field_mappings(void)
+{
+    if (g_mappings_loaded) {
+        return;  // Already loaded
+    }
+    
+    FILE *file = fopen("/etc/libfds/user/element_mapping.txt", "r");
+    if (!file) {
+	perror("Mapping file not found");
+        g_mappings_loaded = true;  // Mark as loaded even if file doesn't exist
+        return;
+    }
+    
+    char line[256];
+    g_mapping_count = 0;
+    
+    while (fgets(line, sizeof(line), file) && g_mapping_count < MAX_MAPPINGS) {
+        // Skip empty lines and comments
+        if (line[0] == '\0' || line[0] == '#' || line[0] == '\n') {
+            continue;
+        }
+        
+        // Parse format: enterpriseName:element_id=custom_name
+        // Example: iana:1=A or enterprise12345:100=B
+        char enterprise_name[64];
+        uint16_t element_id;
+        char custom_name[32];
+        
+        if (sscanf(line, "%63[^:]:%hu=%31s", enterprise_name, &element_id, custom_name) == 3) {
+            strcpy(g_field_mappings[g_mapping_count].enterprise_name, enterprise_name);
+            g_field_mappings[g_mapping_count].element_id = element_id;
+            strcpy(g_field_mappings[g_mapping_count].custom_name, custom_name);
+            g_mapping_count++;
+        }
+    }
+    printf("Totally map %d\n", g_mapping_count);
+    
+    fclose(file);
+    g_mappings_loaded = true;
+}
+
+/**
+ * \brief Look up custom name for a field based on enterprise name and element ID
+ */
+static const char *
+lookup_custom_name(const char *enterprise_name, uint16_t element_id)
+{
+    // Load mappings if not already loaded
+    if (!g_mappings_loaded) {
+        load_field_mappings();
+    }
+    
+    for (int i = 0; i < g_mapping_count; i++) {
+        if (g_field_mappings[i].element_id == element_id && 
+            strcmp(g_field_mappings[i].enterprise_name, enterprise_name) == 0) {
+            return g_field_mappings[i].custom_name;
+        }
+    } 
+    return NULL;  // Not found
+}
 
 /**
  * \brief Conversion function callback
@@ -928,6 +1010,8 @@ static int
 to_stlist(struct context *buffer, const struct fds_drec_field *field);
 static int
 to_stMulList(struct context *buffer, const struct fds_drec_field *field);
+static int
+parse_structured_multifield(const struct fds_drec *rec, struct context *buffer, uint32_t en, uint16_t id, uint16_t iter_flag);
 
 /**
  * \brief Find a conversion function for an IPFIX field
@@ -1018,10 +1102,12 @@ iter_loop(const struct fds_drec *rec, struct context *buffer)
         }
 
         // Add field name "<pen>:<field_name>"
-        ret_code = add_field_name(buffer, &iter.field);
-        if (ret_code != FDS_OK) {
-            return ret_code;
-        }
+	if (!((field_flags & FDS_TFIELD_MULTI_IE) != 0 && (field_flags & FDS_TFIELD_LAST_IE) != 0)) {
+            ret_code = add_field_name(buffer, &iter.field);
+	    if (ret_code != FDS_OK) {
+                return ret_code;
+            }
+	}
 
         // Find a converter
         const struct fds_tfield *def = iter.field.info;
@@ -1042,7 +1128,13 @@ iter_loop(const struct fds_drec *rec, struct context *buffer)
         const size_t writer_offset = buffer_used(buffer);
         if ((field_flags & FDS_TFIELD_MULTI_IE) != 0 && (field_flags & FDS_TFIELD_LAST_IE) != 0) {
             // Conversion of the field with multiple occurrences
-           ret_code = multi_fields(rec, buffer, fn, def->en, def->id, iter_flag);
+            if (def->id == 71) {
+                // Special handling for element ID 71: parse structured data into separate fields
+                ret_code = parse_structured_multifield(rec, buffer, def->en, def->id, iter_flag);
+            } else {
+                // Default multifield handling
+                ret_code = multi_fields(rec, buffer, fn, def->en, def->id, iter_flag);
+            }
         } else {
            ret_code = fn(buffer, &iter.field);
         }
@@ -1393,6 +1485,113 @@ to_stMulList(struct context *buffer, const struct fds_drec_field *field)
 }
 
 /**
+ * \brief Parse structured multifield data (element ID 71) into separate JSON fields
+ * \param[in] rec IPFIX Data Record with the fields
+ * \param[in] buffer Buffer
+ * \param[in] en Enterprise Number of the field
+ * \param[in] id Information Element ID of the field
+ * \param[in] iter_flag Data Record iterator flags
+ * \return #FDS_OK on success
+ * \return #FDS_ERR_NOMEM or #FDS_ERR_BUFFER in case of a memory allocation error
+ */
+static int
+parse_structured_multifield(const struct fds_drec *rec, struct context *buffer, uint32_t en, uint16_t id, uint16_t iter_flag)
+{
+    // Initialize iterator to find all occurrences of this field
+    struct fds_drec_iter iter;
+    fds_drec_iter_init(&iter, (struct fds_drec *) rec, iter_flag);
+    
+    bool first_field = true;
+    int ret_code = FDS_OK;
+    
+    // Look for all fields with the given ID and enterprise number
+    while (fds_drec_iter_next(&iter) != FDS_EOC) {
+        const struct fds_tfield *def = iter.field.info;
+        
+        // Check if this is our target field
+        if (def->id != id || def->en != en) {
+            continue;
+        }
+        
+        // Parse the field data: ["key1=value1","key2=value2",...]
+        char *data_str = (char *)iter.field.data;
+        size_t data_len = iter.field.size;
+        
+        // Create null-terminated copy for parsing
+        char *temp_str = malloc(data_len + 1);
+        if (!temp_str) {
+            return FDS_ERR_NOMEM;
+        }
+        memcpy(temp_str, data_str, data_len);
+        temp_str[data_len] = '\0';
+        
+        // Find the array boundaries [...]
+        char *start = strchr(temp_str, '[');
+        char *end = strrchr(temp_str, ']');
+        
+        if (!start || !end || start >= end) {
+            // Invalid format, skip this field
+            free(temp_str);
+            continue;
+        }
+        
+        start++; // Skip '['
+        *end = '\0'; // Remove ']'
+        
+        // Parse each "key=value" pair
+        char *token = strtok(start, ",");
+        while (token) {
+            // Remove quotes and whitespace
+            while (*token == ' ' || *token == '"') token++;
+            char *token_end = token + strlen(token) - 1;
+            while (token_end > token && (*token_end == ' ' || *token_end == '"')) {
+                *token_end = '\0';
+                token_end--;
+            }
+            
+            // Split by '='
+            char *eq_pos = strchr(token, '=');
+            if (eq_pos) {
+                *eq_pos = '\0';
+                char *key = token;
+                char *value = eq_pos + 1;
+                
+                // Add comma separator if not first field
+                if (!first_field) {
+                    ret_code = buffer_append(buffer, ",");
+                    if (ret_code != FDS_OK) break;
+                }
+                first_field = false;
+                
+                // Add the key-value pair as separate JSON field
+                ret_code = buffer_append(buffer, "\"");
+                if (ret_code != FDS_OK) break;
+                ret_code = buffer_append(buffer, key);
+                if (ret_code != FDS_OK) break;
+                ret_code = buffer_append(buffer, "\":\"");
+                if (ret_code != FDS_OK) break;
+                ret_code = buffer_append(buffer, value);
+                if (ret_code != FDS_OK) break;
+                ret_code = buffer_append(buffer, "\"");
+                if (ret_code != FDS_OK) break;
+            }
+            
+            token = strtok(NULL, ",");
+        }
+        
+        free(temp_str);
+        if (ret_code != FDS_OK) break;
+        
+        // If this is the last occurrence of this field, break
+        if (def->flags & FDS_TFIELD_LAST_IE) {
+            break;
+        }
+    }
+    
+    return ret_code;
+}
+
+/**
  * \brief Append the buffer with a name of an Information Element
  *
  * Identification of the field is added in the long format i.e. '"<scope>:<id>":' or numeric
@@ -1409,7 +1608,34 @@ to_stMulList(struct context *buffer, const struct fds_drec_field *field)
 int
 add_field_name(struct context *buffer, const struct fds_drec_field *field)
 {
+    // Check for custom mapping first - need to get enterprise name
     const struct fds_iemgr_elem *def = field->info->def;
+    const char *custom_name = NULL;
+    
+    if (def && def->scope && def->scope->name) {
+        // We have the enterprise name, check for custom mapping
+        custom_name = lookup_custom_name(def->scope->name, field->info->id);
+    }
+    
+    if (custom_name) {
+        // Use custom mapping
+        size_t custom_len = strlen(custom_name);
+        size_t size = custom_len + 3; // '"' + custom_name + '"' + ':'
+        
+        int ret_code = buffer_reserve(buffer, buffer_used(buffer) + size);
+        if (ret_code != FDS_OK) {
+            return ret_code;
+        }
+        
+        *(buffer->write_begin++) = '"';
+        memcpy(buffer->write_begin, custom_name, custom_len);
+        buffer->write_begin += custom_len;
+        *(buffer->write_begin++) = '"';
+        *(buffer->write_begin++) = ':';
+        return FDS_OK;
+    }
+
+    // Original logic if no custom mapping found (def already declared above)
     bool num_id = ((buffer->flags & FDS_CD2J_NUMERIC_ID) != 0);
 
     // If definition of field is unknown or if flag FDS_CD2J_NUMERIC_ID is set,
@@ -1451,7 +1677,8 @@ add_field_name(struct context *buffer, const struct fds_drec_field *field)
     memcpy(buffer->write_begin, def->name, elem_size);
     buffer->write_begin += elem_size;
     *(buffer->write_begin++) = '"';
-    *(buffer->write_begin++) = ':';
+    *(buffer->write_begin++) = '!';
+    
 
     return FDS_OK;
 }
