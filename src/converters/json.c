@@ -1102,12 +1102,12 @@ iter_loop(const struct fds_drec *rec, struct context *buffer)
         }
 
         // Add field name "<pen>:<field_name>"
-	if (!((field_flags & FDS_TFIELD_MULTI_IE) != 0 && (field_flags & FDS_TFIELD_LAST_IE) != 0)) {
+	 if (!((field_flags & FDS_TFIELD_MULTI_IE) != 0 && (field_flags & FDS_TFIELD_LAST_IE) != 0)) {
             ret_code = add_field_name(buffer, &iter.field);
 	    if (ret_code != FDS_OK) {
                 return ret_code;
             }
-	}
+	 }
 
         // Find a converter
         const struct fds_tfield *def = iter.field.info;
@@ -1128,13 +1128,14 @@ iter_loop(const struct fds_drec *rec, struct context *buffer)
         const size_t writer_offset = buffer_used(buffer);
         if ((field_flags & FDS_TFIELD_MULTI_IE) != 0 && (field_flags & FDS_TFIELD_LAST_IE) != 0) {
             // Conversion of the field with multiple occurrences
-            if (def->id == 71) {
+             if (def->id == 71) {
                 // Special handling for element ID 71: parse structured data into separate fields
-                ret_code = parse_structured_multifield(rec, buffer, def->en, def->id, iter_flag);
-            } else {
+                 ret_code = parse_structured_multifield(rec, buffer, def->en, def->id, iter_flag);
+             } else {
                 // Default multifield handling
                 ret_code = multi_fields(rec, buffer, fn, def->en, def->id, iter_flag);
             }
+                                   
         } else {
            ret_code = fn(buffer, &iter.field);
         }
@@ -1525,37 +1526,24 @@ parse_structured_multifield(const struct fds_drec *rec, struct context *buffer, 
         memcpy(temp_str, data_str, data_len);
         temp_str[data_len] = '\0';
         
-        // Find the array boundaries [...]
-        char *start = strchr(temp_str, '[');
-        char *end = strrchr(temp_str, ']');
-        
-        if (!start || !end || start >= end) {
-            // Invalid format, skip this field
-            free(temp_str);
-            continue;
-        }
-        
-        start++; // Skip '['
-        *end = '\0'; // Remove ']'
-        
-        // Parse each "key=value" pair
-        char *token = strtok(start, ",");
-        while (token) {
-            // Remove quotes and whitespace
-            while (*token == ' ' || *token == '"') token++;
-            char *token_end = token + strlen(token) - 1;
-            while (token_end > token && (*token_end == ' ' || *token_end == '"')) {
-                *token_end = '\0';
-                token_end--;
-            }
+	char *start = &temp_str[0];
+	char *end = &temp_str[data_len - 1];
             
             // Split by '='
-            char *eq_pos = strchr(token, '=');
+	    char *eq_pos = strchr(start, '=');
             if (eq_pos) {
                 *eq_pos = '\0';
-                char *key = token;
+		char *key = start;
                 char *value = eq_pos + 1;
-                
+                if (strcmp(key, "IMEISV") == 0) {
+	            key = "E";
+                } else if (strcmp(key, "imsiMCC") == 0) {
+                    key = "U";
+                } else if (strcmp(key, "imsiMNC") == 0) {
+		    key = "V";
+		} else {
+		    printf("parsing error: no key (%s)\n", key);
+		}
                 // Add comma separator if not first field
                 if (!first_field) {
                     ret_code = buffer_append(buffer, ",");
@@ -1576,8 +1564,8 @@ parse_structured_multifield(const struct fds_drec *rec, struct context *buffer, 
                 if (ret_code != FDS_OK) break;
             }
             
-            token = strtok(NULL, ",");
-        }
+            // token = strtok(NULL, ",");
+        // }
         
         free(temp_str);
         if (ret_code != FDS_OK) break;
@@ -1677,7 +1665,7 @@ add_field_name(struct context *buffer, const struct fds_drec_field *field)
     memcpy(buffer->write_begin, def->name, elem_size);
     buffer->write_begin += elem_size;
     *(buffer->write_begin++) = '"';
-    *(buffer->write_begin++) = '!';
+    *(buffer->write_begin++) = ':';
     
 
     return FDS_OK;
@@ -1712,12 +1700,16 @@ fds_drec2json(const struct fds_drec *rec, uint32_t flags, const fds_iemgr_t *ie_
     record.snap = rec->snap;
 
     // Convert the record
+    
     int ret_code;
+    /*
     if (rec->tmplt->type == FDS_TYPE_TEMPLATE_OPTS) {
         ret_code = buffer_append(&record,"{\"@type\":\"ipfix.optionsEntry\",");
     } else {
         ret_code = buffer_append(&record, "{\"@type\":\"ipfix.entry\",");
     }
+    */
+    ret_code = buffer_append(&record, "{");
     if (ret_code != FDS_OK) {
         goto error;
     }
