@@ -1095,16 +1095,34 @@ iter_loop(const struct fds_drec *rec, struct context *buffer)
         // Separate fields
         if (added != 0) {
             // Add comma
-            ret_code = buffer_append(buffer, ",");
-            if (ret_code != FDS_OK) {
-                return ret_code;
+	    char *tmp_name = iter.field.info->def->scope->name;
+            uint16_t tmp_id = iter.field.info->id;
+	    if ((field_flags & FDS_TFIELD_MULTI_IE) != 0 && (field_flags & FDS_TFIELD_LAST_IE) != 0) {
+                ret_code = buffer_append(buffer, ",");
+                if (ret_code != FDS_OK) {
+                   return ret_code;
+                }
+	    }
+	    else if (lookup_custom_name(tmp_name, tmp_id)){
+                ret_code = buffer_append(buffer, ",");
+                if (ret_code != FDS_OK) {
+                   return ret_code;
+                }
+    	    }
+	    else{
+                continue;
             }
-        }
+	}
+	
 
         // Add field name "<pen>:<field_name>"
 	 if (!((field_flags & FDS_TFIELD_MULTI_IE) != 0 && (field_flags & FDS_TFIELD_LAST_IE) != 0)) {
+//	 if (def->id == 71){
             ret_code = add_field_name(buffer, &iter.field);
-	    if (ret_code != FDS_OK) {
+	    if (ret_code == FDS_ERR_MAPPING_NOTFOUND){
+                continue;
+	    }
+	    else if (ret_code != FDS_OK) {
                 return ret_code;
             }
 	 }
@@ -1504,7 +1522,7 @@ parse_structured_multifield(const struct fds_drec *rec, struct context *buffer, 
     
     bool first_field = true;
     int ret_code = FDS_OK;
-    
+    int index = 0;
     // Look for all fields with the given ID and enterprise number
     while (fds_drec_iter_next(&iter) != FDS_EOC) {
         const struct fds_tfield *def = iter.field.info;
@@ -1525,51 +1543,67 @@ parse_structured_multifield(const struct fds_drec *rec, struct context *buffer, 
         }
         memcpy(temp_str, data_str, data_len);
         temp_str[data_len] = '\0';
-        
+        // printf("IMEI_STR: %s\n", temp_str);
 	char *start = &temp_str[0];
 	char *end = &temp_str[data_len - 1];
             
             // Split by '='
-	    char *eq_pos = strchr(start, '=');
-            if (eq_pos) {
-                *eq_pos = '\0';
+	char *eq_pos = strchr(start, '=');
+	if (eq_pos) {
+		*eq_pos = '\0';
 		char *key = start;
-                char *value = eq_pos + 1;
-                if (strcmp(key, "IMEISV") == 0) {
-	            key = "E";
-                } else if (strcmp(key, "imsiMCC") == 0) {
-                    key = "U";
-                } else if (strcmp(key, "imsiMNC") == 0) {
-		    key = "V";
+		char *value = eq_pos + 1;
+		if (strcmp(key, "imeisv") == 0 || strcmp(key, "IMEISV") == 0) {
+			key = "E";
+		} else if (strcmp(key, "mcc") == 0 || strcmp(key, "imsiMCC") == 0) {
+			key = "U";
+		} else if (strcmp(key, "mnc") == 0 || strcmp(key, "imsiMNC") == 0) {
+			key = "V";
 		} else {
-		    printf("parsing error: no key (%s)\n", key);
+			printf("parsing error: no key (%s)\n", key);
 		}
-                // Add comma separator if not first field
-                if (!first_field) {
-                    ret_code = buffer_append(buffer, ",");
-                    if (ret_code != FDS_OK) break;
-                }
-                first_field = false;
                 
-                // Add the key-value pair as separate JSON field
-                ret_code = buffer_append(buffer, "\"");
-                if (ret_code != FDS_OK) break;
-                ret_code = buffer_append(buffer, key);
-                if (ret_code != FDS_OK) break;
-                ret_code = buffer_append(buffer, "\":\"");
-                if (ret_code != FDS_OK) break;
-                ret_code = buffer_append(buffer, value);
-                if (ret_code != FDS_OK) break;
-                ret_code = buffer_append(buffer, "\"");
-                if (ret_code != FDS_OK) break;
-            }
-            
-            // token = strtok(NULL, ",");
-        // }
-        
-        free(temp_str);
-        if (ret_code != FDS_OK) break;
-        
+	        // switch (index) {
+		//     case 0:
+		// 	key = "E";
+		// 	break;
+		//     case 1:
+		// 	key = "U";
+		// 	break;
+		//     case 2:
+		// 	key = "V";
+		// 	break;
+		//     default:
+		// 	break;
+		// }	
+
+		// Add comma separator if not first field
+		if (!first_field) {
+			ret_code = buffer_append(buffer, ",");
+			if (ret_code != FDS_OK) break;
+		}
+		first_field = false;
+
+		// Add the key-value pair as separate JSON field
+		ret_code = buffer_append(buffer, "\"");
+		if (ret_code != FDS_OK) break;
+		ret_code = buffer_append(buffer, key);
+		if (ret_code != FDS_OK) break;
+		ret_code = buffer_append(buffer, "\":\"");
+		if (ret_code != FDS_OK) break;
+		ret_code = buffer_append(buffer, value);
+		if (ret_code != FDS_OK) break;
+		ret_code = buffer_append(buffer, "\"");
+		if (ret_code != FDS_OK) break;
+		index++;
+	}
+
+	// token = strtok(NULL, ",");
+	// }
+
+	free(temp_str);
+	if (ret_code != FDS_OK) break;
+
         // If this is the last occurrence of this field, break
         if (def->flags & FDS_TFIELD_LAST_IE) {
             break;
@@ -1577,6 +1611,29 @@ parse_structured_multifield(const struct fds_drec *rec, struct context *buffer, 
     }
     
     return ret_code;
+}
+
+// Global variables for shard key logic
+int count = 0;
+int shard_key = 0;
+
+/**
+ * \brief Get shard key
+ *
+ * This function provides a shard key that is toggled between 0 and 1
+ * every 100000 calls. It is used for partitioning the data across
+ * different shards in a distributed system.
+ *
+ * \return Current shard key (0 or 1)
+ */
+int get_shard_key() {
+    int cur_shard = shard_key;
+    count++;
+    if (count >= 1000) {
+        count = 0;
+        shard_key = (shard_key == 0) ? 1 : 0;
+    }
+    return cur_shard;
 }
 
 /**
@@ -1621,6 +1678,9 @@ add_field_name(struct context *buffer, const struct fds_drec_field *field)
         *(buffer->write_begin++) = '"';
         *(buffer->write_begin++) = ':';
         return FDS_OK;
+    }
+    else{
+	    return FDS_ERR_MAPPING_NOTFOUND;
     }
 
     // Original logic if no custom mapping found (def already declared above)
@@ -1699,6 +1759,9 @@ fds_drec2json(const struct fds_drec *rec, uint32_t flags, const fds_iemgr_t *ie_
     record.mgr = ie_mgr;
     record.snap = rec->snap;
 
+    // Get shard key
+    int cur_shard = get_shard_key();
+    
     // Convert the record
     
     int ret_code;
@@ -1709,7 +1772,9 @@ fds_drec2json(const struct fds_drec *rec, uint32_t flags, const fds_iemgr_t *ie_
         ret_code = buffer_append(&record, "{\"@type\":\"ipfix.entry\",");
     }
     */
-    ret_code = buffer_append(&record, "{");
+    char shard_key_str[64];
+    snprintf(shard_key_str, sizeof(shard_key_str), "{\"shk\":%d,", cur_shard);
+    ret_code = buffer_append(&record, shard_key_str);
     if (ret_code != FDS_OK) {
         goto error;
     }
